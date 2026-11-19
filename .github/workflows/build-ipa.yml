@@ -18,6 +18,12 @@ jobs:
       - name: Build unsigned app
         run: |
           xcodebuild -project LibreTV.xcodeproj -scheme LibreTV -configuration Release -destination 'generic/platform=iOS' -derivedDataPath build CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
+      - name: Allow plain HTTP (LAN / IPv6 direct)
+        run: |
+          PLIST="build/Build/Products/Release-iphoneos/LibreTV.app/Info.plist"
+          /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity dict" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity:NSAllowsArbitraryLoads bool true" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Print :NSAppTransportSecurity" "$PLIST"
       - name: Package IPA
         run: |
           mkdir -p Payload
@@ -34,4 +40,4 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "build-${{ github.run_number }}" LibreTV.ipa --title "LibreTV build ${{ github.run_number }}" --notes "LibreTV 套壳版，未签名 IPA，可用直装工具安装测试。首次打开需粘贴服务器地址。"
+          gh release create "build-${{ github.run_number }}" LibreTV.ipa --title "LibreTV build ${{ github.run_number }}" --notes "LibreTV 2.2.0 未签名 IPA：修复物理音量键；新增局域网直连、IPv6 直连与公网兜底，自动选择最快线路。可用直装工具安装。"
