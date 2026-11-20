@@ -67,7 +67,7 @@ enum RouteProbe {
 
     static func select() async -> (base: String, kind: Int, elapsed: Int) {
         let result = await withTaskGroup(of: (base: String, kind: Int, elapsed: Int?).self) { group -> (String, Int, Int)? in
-            for entry in candidates() {
+            for entry in RouteConfig.candidates() {
                 group.addTask { (entry.base, entry.kind, await measure(entry.base)) }
             }
             var best: (String, Int, Int)?
