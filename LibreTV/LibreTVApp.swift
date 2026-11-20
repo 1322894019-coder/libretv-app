@@ -5,8 +5,12 @@ import AVFoundation
 // MARK: - Route configuration (LAN / IPv6 / public)
 
 enum RouteConfig {
-    // Public Funnel address, kept unchanged and used as the final fallback.
-    static let defaultPublic = "https://libretv.tailee3645.ts.net"
+    // 新的默认 / 优先公网（ngrok 免费固定域名，重启不变）。
+    static let newPublic = "https://revivable-outsell-perch.ngrok-free.dev"
+    // 原公网（Tailscale Funnel），保留为备用公网。
+    static let backupPublic = "https://libretv.tailee3645.ts.net"
+    // 历史代码里的默认公网现在指向新的优先地址。
+    static let defaultPublic = newPublic
 
     // LAN direct candidates (the PC's fixed Wi-Fi addresses).
     static let lan = [
@@ -22,12 +26,13 @@ enum RouteConfig {
         "http://[240e:314:b818:200:2f72:4a42:e4d3:35e3]:8080"
     ]
 
-    // Lower raw value wins: LAN (0) > IPv6 (1) > public (2).
+    // Lower raw value wins: LAN (0) > IPv6 (1) > new public (2) > backup public (3).
     static func candidates() -> [(base: String, kind: Int)] {
         var list: [(String, Int)] = []
         lan.forEach { list.append(($0, 0)) }
         ipv6.forEach { list.append(($0, 1)) }
-        list.append((defaultPublic, 2))
+        list.append((newPublic, 2))
+        list.append((backupPublic, 3))
         return list
     }
 
@@ -35,7 +40,8 @@ enum RouteConfig {
         switch kind {
         case 0: return "局域网直连 · \(elapsed)ms"
         case 1: return "IPv6 直连 · \(elapsed)ms"
-        default: return elapsed > 0 ? "公网安全回退 · \(elapsed)ms" : "公网安全回退"
+        case 3: return elapsed > 0 ? "备用公网 Tailscale · \(elapsed)ms" : "备用公网 Tailscale"
+        default: return elapsed > 0 ? "公网固定域名 ngrok · \(elapsed)ms" : "公网固定域名 ngrok"
         }
     }
 }
@@ -132,7 +138,12 @@ struct WebView: UIViewRepresentable {
         refresh.addTarget(context.coordinator, action: #selector(Coordinator.handleRefresh(_:)), for: .valueChanged)
         webView.scrollView.refreshControl = refresh
         if let url = URL(string: urlString) {
-            webView.load(URLRequest(url: url))
+            var request = URLRequest(url: url)
+            // ngrok 免费版顶层导航需带跳过标记，否则首屏会是安全提示页。
+            if urlString.hasPrefix(RouteConfig.newPublic) {
+                request.setValue("1", forHTTPHeaderField: "ngrok-skip-browser-warning")
+            }
+            webView.load(request)
         }
         return webView
     }
@@ -213,7 +224,10 @@ struct ContentView: View {
     }
 
     private var currentLabel: String {
-        autoRoute ? RouteConfig.label(for: routeKind, elapsed: routeElapsed) : "手动模式 · 自定义地址"
+        if autoRoute { return RouteConfig.label(for: routeKind, elapsed: routeElapsed) }
+        if manualURL == RouteConfig.newPublic { return "手动 · 公网固定域名 ngrok" }
+        if manualURL == RouteConfig.backupPublic { return "手动 · 备用公网 Tailscale" }
+        return "手动模式 · 自定义地址"
     }
 
     private var bootView: some View {
@@ -271,59 +285,103 @@ struct BrowserView: View {
     }
 }
 
+enum ServerChoice: String, CaseIterable, Identifiable {
+    case auto, ngrok, tailscale, custom
+    var id: String { rawValue }
+}
+
 struct SettingsView: View {
     @Binding var autoRoute: Bool
     @Binding var manualURL: String
     @Environment(\.dismiss) private var dismiss
-    @State private var draft = ""
+    @State private var choice: ServerChoice = .auto
+    @State private var customDraft = ""
     @State private var error = ""
 
     var body: some View {
         Form {
-            Section("连接方式") {
-                Toggle("自动选择最快线路（局域网 / IPv6 / 公网）", isOn: $autoRoute)
-            } footer: {
-                Text("默认开启。公网地址保持不变作为兜底，局域网和 IPv6 直连优先，网页打开更快。")
+            Section {
+                optionRow(.auto, "自动直连（推荐）", "自动探测局域网 / IPv6 / 公网，选最快的")
             }
-
-            Section("手动服务器地址") {
-                TextField("https://… 或 http://…", text: $draft)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .keyboardType(.URL)
-                if !error.isEmpty { Text(error).font(.footnote).foregroundStyle(.red) }
-                Button("保存手动地址") { save() }
-                Button("恢复自动直连") {
-                    autoRoute = true
-                    dismiss()
+            Section("公网地址（优先新地址）") {
+                optionRow(.ngrok, "新固定域名", RouteConfig.newPublic)
+                optionRow(.tailscale, "原地址（备用）", RouteConfig.backupPublic)
+            }
+            Section("自定义公网地址") {
+                optionRow(.custom, "自定义填写", "完整的 http:// 或 https:// 地址")
+                if choice == .custom {
+                    TextField("https://example.com", text: $customDraft)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .keyboardType(.URL)
+                    if !error.isEmpty { Text(error).font(.footnote).foregroundStyle(.red) }
                 }
-            } footer: {
-                Text("保存手动地址后会切换为手动模式，可随时用上面的开关恢复自动直连。")
             }
-
             Section("关于") {
-                LabeledContent("客户端", value: "LibreTV iOS 2.2.0")
+                LabeledContent("客户端", value: "LibreTV iOS 2.3.0")
                 Text("基于系统 WKWebView；影视搜索与播放由你的 LibreTV 服务提供。")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
-        .navigationTitle("服务器设置")
+        .navigationTitle("服务器地址")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
-            ToolbarItem(placement: .cancellationAction) { Button("关闭") { dismiss() } }
+            ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }
+            ToolbarItem(placement: .confirmationAction) { Button("连接") { apply() } }
         }
-        .onAppear { draft = manualURL }
+        .onAppear {
+            if autoRoute {
+                choice = .auto
+            } else if manualURL == RouteConfig.newPublic {
+                choice = .ngrok
+            } else if manualURL == RouteConfig.backupPublic {
+                choice = .tailscale
+            } else {
+                choice = .custom
+                customDraft = manualURL
+            }
+        }
     }
 
-    private func save() {
-        var text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !text.hasPrefix("http://") && !text.hasPrefix("https://") { text = "https://" + text }
-        guard let url = URL(string: text), url.host != nil else {
-            error = "地址不对，检查一下"
-            return
+    private func optionRow(_ c: ServerChoice, _ title: String, _ sub: String) -> some View {
+        Button {
+            choice = c
+        } label: {
+            HStack(spacing: 10) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title).foregroundStyle(.primary)
+                    Text(sub).font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                if choice == c { Image(systemName: "checkmark").foregroundStyle(.cyan) }
+            }
         }
-        manualURL = text
-        autoRoute = false
-        dismiss()
+    }
+
+    private func apply() {
+        switch choice {
+        case .auto:
+            autoRoute = true
+            dismiss()
+        case .ngrok:
+            autoRoute = false
+            manualURL = RouteConfig.newPublic
+            dismiss()
+        case .tailscale:
+            autoRoute = false
+            manualURL = RouteConfig.backupPublic
+            dismiss()
+        case .custom:
+            var text = customDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+            if text.isEmpty { error = "请填写地址"; return }
+            if !text.hasPrefix("http://") && !text.hasPrefix("https://") { text = "https://" + text }
+            guard let u = URL(string: text), u.host != nil else {
+                error = "地址不对，检查一下"
+                return
+            }
+            autoRoute = false
+            manualURL = text
+            dismiss()
+        }
     }
 }
