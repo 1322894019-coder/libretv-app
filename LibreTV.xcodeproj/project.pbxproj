@@ -8,10 +8,12 @@
 
 /* Begin PBXBuildFile section */
 		222222222222222222222201 /* LibreTVApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 222222222222222222222202 /* LibreTVApp.swift */; };
+		333333333333333333333301 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 333333333333333333333302 /* Assets.xcassets */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		222222222222222222222202 /* LibreTVApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibreTVApp.swift; sourceTree = "<group>"; };
+		333333333333333333333302 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		222222222222222222222203 /* LibreTV.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = LibreTV.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -38,6 +40,7 @@
 			isa = PBXGroup;
 			children = (
 				222222222222222222222202 /* LibreTVApp.swift */,
+				333333333333333333333302 /* Assets.xcassets */,
 			);
 			path = LibreTV;
 			sourceTree = "<group>";
@@ -77,7 +80,7 @@
 			isa = PBXProject;
 			attributes = {
 				BuildIndependentTargetsInParallel = 1;
-				LastUpgradeCheck = 1500;
+				LastUpgradeCheck = 150;
 				TargetAttributes = {
 					222222222222222222222208 = {
 						CreatedOnToolsVersion = 15.0;
@@ -93,11 +96,11 @@
 				Base,
 			);
 			mainGroup = 222222222222222222222205;
-			productRefGroup = 222222222222222222222207 /* Products */;
+			productRefGroup = 222222222222222222222207;
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
-				222222222222222222222208 /* LibreTV */,
+				222222222222222222222208,
 			);
 		};
 /* End PBXProject section */
@@ -107,6 +110,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				333333333333333333333301 /* Assets.xcassets in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

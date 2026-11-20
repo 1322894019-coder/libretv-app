@@ -4,85 +4,175 @@ import AVFoundation
 
 // MARK: - Route configuration (LAN / IPv6 / public)
 
-enum RouteConfig {
-    // 新的默认 / 优先公网（ngrok 免费固定域名，重启不变）。
-    static let newPublic = "https://revivable-outsell-perch.ngrok-free.dev"
-    // 原公网（Tailscale Funnel），保留为备用公网。
-    static let backupPublic = "https://libretv.tailee3645.ts.net"
-    // 历史代码里的默认公网现在指向新的优先地址。
-    static let defaultPublic = newPublic
+enum RouteKind: Int, CaseIterable {
+    case lan = 0
+    case ipv6 = 1
+    case publicRoute = 2
 
-    // LAN direct candidates (the PC's fixed Wi-Fi addresses).
-    static let lan = [
-        "http://192.168.1.5:8080",
-        "http://192.168.1.22:8080"
-    ]
-
-    // IPv6 direct candidates (the PC's stable global IPv6 addresses).
-    static let ipv6 = [
-        "http://[240e:314:b818:28d:a7b6:1f23:2d61:f241]:8080",
-        "http://[240e:314:b818:200:905f:546c:4484:7176]:8080",
-        "http://[240e:314:b818:28d:97e7:f51a:7497:b9f]:8080",
-        "http://[240e:314:b818:200:2f72:4a42:e4d3:35e3]:8080"
-    ]
-
-    // Lower raw value wins: LAN (0) > IPv6 (1) > new public (2) > backup public (3).
-    static func candidates() -> [(base: String, kind: Int)] {
-        var list: [(String, Int)] = []
-        lan.forEach { list.append(($0, 0)) }
-        ipv6.forEach { list.append(($0, 1)) }
-        list.append((newPublic, 2))
-        list.append((backupPublic, 3))
-        return list
+    var label: String {
+        switch self {
+        case .lan: return "局域网直连"
+        case .ipv6: return "IPv6 直连"
+        case .publicRoute: return "公网中转"
+        }
     }
 
-    static func label(for kind: Int, elapsed: Int) -> String {
-        switch kind {
-        case 0: return "局域网直连 · \(elapsed)ms"
-        case 1: return "IPv6 直连 · \(elapsed)ms"
-        case 3: return elapsed > 0 ? "备用公网 Tailscale · \(elapsed)ms" : "备用公网 Tailscale"
-        default: return elapsed > 0 ? "公网固定域名 ngrok · \(elapsed)ms" : "公网固定域名 ngrok"
+    var icon: String {
+        switch self {
+        case .lan: return "wifi"
+        case .ipv6: return "network"
+        case .publicRoute: return "globe"
         }
     }
 }
 
-@MainActor
+struct RouteCandidate {
+    let base: String
+    let kind: RouteKind
+    let name: String
+}
+
+// One row per built-in line. `latency == nil` means probing/unknown or
+// unreachable after the probe finishes.
+struct RouteProbeResult: Identifiable, Equatable {
+    let base: String
+    let kind: RouteKind
+    let name: String
+    var latency: Int?
+    var probing: Bool
+
+    var id: String { base }
+    var reachable: Bool { latency != nil }
+}
+
+enum RouteConfig {
+    // ngrok free fixed domain (does not change on restart).
+    static let newPublic = "https://revivable-outsell-perch.ngrok-free.dev"
+    // Tailscale Funnel, kept as a backup public line.
+    static let backupPublic = "https://libretv.tailee3645.ts.net"
+    static let defaultPublic = newPublic
+
+    // Built-in lines, updated to the machine's current addresses. A stale line
+    // is simply reported as unreachable; it never breaks the rest of the list.
+    static func candidates() -> [RouteCandidate] {
+        [
+            RouteCandidate(base: "http://192.168.2.238:8080", kind: .lan, name: "局域网直连 · 以太网"),
+            RouteCandidate(base: "http://192.168.1.22:8080", kind: .lan, name: "局域网直连 · 无线"),
+
+            RouteCandidate(base: "http://[240e:314:b818:28d:a7b6:1f23:2d61:f241]:8080",
+                           kind: .ipv6, name: "IPv6 直连 · 以太网"),
+            RouteCandidate(base: "http://[240e:314:b818:200:905f:546c:4484:7176]:8080",
+                           kind: .ipv6, name: "IPv6 直连 · 以太网备用"),
+            RouteCandidate(base: "http://[240e:314:b818:200:2f72:4a42:e4d3:35e3]:8080",
+                           kind: .ipv6, name: "IPv6 直连 · 无线"),
+
+            RouteCandidate(base: newPublic, kind: .publicRoute, name: "公网中转 · ngrok"),
+            RouteCandidate(base: backupPublic, kind: .publicRoute, name: "公网中转 · Tailscale")
+        ]
+    }
+
+    static func initial(probing: Bool = false) -> [RouteProbeResult] {
+        candidates().map {
+            RouteProbeResult(base: $0.base, kind: $0.kind, name: $0.name,
+                             latency: nil, probing: probing)
+        }
+    }
+
+    static func isValid(_ base: String) -> Bool {
+        guard let url = URL(string: base), let scheme = url.scheme?.lowercased(),
+              ["http", "https"].contains(scheme), let host = url.host, !host.isEmpty else {
+            return false
+        }
+        return url.user == nil && url.password == nil
+    }
+}
+
+// MARK: - Latency probe
+
+// Non-isolated so each measurement runs concurrently on background threads
+// instead of hopping onto the main actor.
 enum RouteProbe {
-    private static func measure(_ base: String) async -> Int? {
-        guard let url = URL(string: base + "/api/status") else { return nil }
-        var request = URLRequest(url: url, timeoutInterval: 1.0)
+    static func measure(_ base: String) async -> (String, Int?) {
+        guard let url = URL(string: base + "/api/status") else { return (base, nil) }
+        var request = URLRequest(url: url, timeoutInterval: 1.2)
         request.cachePolicy = .reloadIgnoringLocalCacheData
         request.httpMethod = "GET"
         let start = Date()
         do {
             let (_, response) = try await URLSession.shared.data(for: request)
             if let http = response as? HTTPURLResponse, (200..<500).contains(http.statusCode) {
-                return max(1, Int(Date().timeIntervalSince(start) * 1000))
+                return (base, max(1, Int(Date().timeIntervalSince(start) * 1000)))
             }
-            return nil
+            return (base, nil)
         } catch {
-            return nil
+            return (base, nil)
         }
-    }
-
-    static func select() async -> (base: String, kind: Int, elapsed: Int) {
-        let result = await withTaskGroup(of: (base: String, kind: Int, elapsed: Int?).self) { group -> (String, Int, Int)? in
-            for entry in RouteConfig.candidates() {
-                group.addTask { (entry.base, entry.kind, await measure(entry.base)) }
-            }
-            var best: (String, Int, Int)?
-            for await item in group {
-                guard let ms = item.elapsed else { continue }
-                if best == nil || item.kind < best!.1 || (item.kind == best!.1 && ms < best!.2) {
-                    best = (item.base, item.kind, ms)
-                }
-            }
-            return best
-        }
-        if let result { return result }
-        return (RouteConfig.defaultPublic, 2, 0)
     }
 }
+
+// Observable route table shared by the boot screen and the settings sheet.
+@MainActor
+final class RouteMonitor: ObservableObject {
+    @Published private(set) var results: [RouteProbeResult] = RouteConfig.initial()
+    @Published private(set) var isProbing = false
+    @Published private(set) var fastestBase: String?
+
+    // Probe every line, update rows live, then sort so the fastest reachable
+    // line is first. Returns the base URL the app should connect to.
+    func probe() async -> String {
+        isProbing = true
+        fastestBase = nil
+        results = RouteConfig.initial(probing: true)
+
+        await withTaskGroup(of: (String, Int?).self) { group in
+            for entry in RouteConfig.candidates() {
+                group.addTask { await RouteProbe.measure(entry.base) }
+            }
+            for await (base, ms) in group {
+                guard let index = results.firstIndex(where: { $0.base == base }) else { continue }
+                results[index].latency = ms
+                results[index].probing = false
+            }
+        }
+
+        for index in results.indices { results[index].probing = false }
+
+        // Reachable first by measured latency (fastest pinned to top);
+        // unreachable lines sink to the bottom.
+        results.sort { lhs, rhs in
+            switch (lhs.latency, rhs.latency) {
+            case let (left?, right?):
+                if left != right { return left < right }
+                return lhs.kind.rawValue < rhs.kind.rawValue
+            case (_?, nil):
+                return true
+            case (nil, _?):
+                return false
+            default:
+                return lhs.kind.rawValue < rhs.kind.rawValue
+            }
+        }
+
+        fastestBase = results.first { $0.latency != nil }?.base
+        isProbing = false
+
+        if let best = results.first(where: { $0.latency != nil }) {
+            return best.base
+        }
+        // Every direct line failed: keep the app usable via the public default.
+        return RouteConfig.defaultPublic
+    }
+
+    func label(for base: String) -> String {
+        if let route = results.first(where: { $0.base == base }) {
+            if let ms = route.latency { return "\(route.name) · \(ms)ms" }
+            return route.name
+        }
+        return "自定义地址 · 手动模式"
+    }
+}
+
+// MARK: - App entry
 
 @main
 struct LibreTVApp: App {
@@ -104,6 +194,8 @@ struct LibreTVApp: App {
         }
     }
 }
+
+// MARK: - WKWebView store
 
 final class WebViewStore: ObservableObject {
     let webView: WKWebView
@@ -139,7 +231,8 @@ struct WebView: UIViewRepresentable {
         webView.scrollView.refreshControl = refresh
         if let url = URL(string: urlString) {
             var request = URLRequest(url: url)
-            // ngrok 免费版顶层导航需带跳过标记，否则首屏会是安全提示页。
+            // ngrok free top-level navigation needs this header or the first
+            // screen is its browser-warning page.
             if urlString.hasPrefix(RouteConfig.newPublic) {
                 request.setValue("1", forHTTPHeaderField: "ngrok-skip-browser-warning")
             }
@@ -154,7 +247,7 @@ struct WebView: UIViewRepresentable {
         let store: WebViewStore
         private var progressObservation: NSKeyValueObservation?
 
-        init(store: WebViewStore) { self.store = store }
+        init(store: WebView) { self.store = store }
 
         func startObserving(webView: WKWebView) {
             progressObservation = webView.observe(\.estimatedProgress, options: [.new]) { [weak self] webView, _ in
@@ -187,47 +280,50 @@ struct WebView: UIViewRepresentable {
     }
 }
 
+// MARK: - Root content
+
 struct ContentView: View {
-    // autoRoute=true: pick the fastest of LAN/IPv6/public. false: use the manual address.
+    @StateObject private var monitor = RouteMonitor()
     @AppStorage("autoRoute") private var autoRoute = true
     @AppStorage("manualURL") private var manualURL = ""
     @State private var resolvedURL = ""
-    @State private var routeKind = 2
-    @State private var routeElapsed = 0
     @State private var showSettings = false
-    @State private var probing = true
+    @State private var booting = true
 
     private var activeURL: String {
-        autoRoute ? resolvedURL : (manualURL.isEmpty ? RouteConfig.defaultPublic : manualURL)
+        if autoRoute {
+            return resolvedURL.isEmpty ? RouteConfig.defaultPublic : resolvedURL
+        }
+        return manualURL.isEmpty ? RouteConfig.defaultPublic : manualURL
     }
 
     var body: some View {
         Group {
-            if probing && autoRoute {
+            if booting && autoRoute {
                 bootView
             } else {
                 NavigationStack {
-                    BrowserView(urlString: activeURL, routeLabel: currentLabel, showSettings: $showSettings)
+                    BrowserView(urlString: activeURL,
+                                routeLabel: monitor.label(for: activeURL),
+                                showSettings: $showSettings)
                 }
                 .id(activeURL)
                 .sheet(isPresented: $showSettings) {
                     NavigationStack {
-                        SettingsView(autoRoute: $autoRoute, manualURL: $manualURL)
+                        SettingsView(monitor: monitor,
+                                     autoRoute: $autoRoute,
+                                     manualURL: $manualURL,
+                                     resolvedURL: $resolvedURL)
                     }
                 }
             }
         }
         .task {
-            if autoRoute { await runProbe() }
-            probing = false
+            if autoRoute {
+                resolvedURL = await monitor.probe()
+            }
+            booting = false
         }
-    }
-
-    private var currentLabel: String {
-        if autoRoute { return RouteConfig.label(for: routeKind, elapsed: routeElapsed) }
-        if manualURL == RouteConfig.newPublic { return "手动 · 公网固定域名 ngrok" }
-        if manualURL == RouteConfig.backupPublic { return "手动 · 备用公网 Tailscale" }
-        return "手动模式 · 自定义地址"
     }
 
     private var bootView: some View {
@@ -236,16 +332,9 @@ struct ContentView: View {
                 .font(.system(size: 56))
                 .foregroundStyle(.cyan)
             ProgressView()
-            Text("正在检测最快线路…").foregroundStyle(.secondary)
+            Text("正在检测所有线路延迟…").foregroundStyle(.secondary)
             Text("局域网直连 · IPv6 直连 · 公网兜底").font(.footnote).foregroundStyle(.secondary)
         }
-    }
-
-    private func runProbe() async {
-        let result = await RouteProbe.select()
-        resolvedURL = result.base
-        routeKind = result.kind
-        routeElapsed = result.elapsed
     }
 }
 
@@ -278,110 +367,223 @@ struct BrowserView: View {
                 Button(action: { store.webView.goForward() }) { Image(systemName: "chevron.right") }
                     .disabled(!store.canGoForward)
                 Spacer()
-                Button(action: { store.webView.reload() }) { Image(systemName: "arrow.clockwork") }
+                Button(action: { store.webView.reload() }) { Image(systemName: "arrow.clockwise") }
                 Button(action: { showSettings = true }) { Image(systemName: "gearshape") }
             }
         }
     }
 }
 
-enum ServerChoice: String, CaseIterable, Identifiable {
-    case auto, ngrok, tailscale, custom
-    var id: String { rawValue }
-}
+// MARK: - Settings with the live latency table
 
 struct SettingsView: View {
+    @ObservedObject var monitor: RouteMonitor
     @Binding var autoRoute: Bool
     @Binding var manualURL: String
+    @Binding var resolvedURL: String
+
     @Environment(\.dismiss) private var dismiss
-    @State private var choice: ServerChoice = .auto
     @State private var customDraft = ""
     @State private var error = ""
+
+    private var currentBase: String {
+        autoRoute ? resolvedURL : manualURL
+    }
 
     var body: some View {
         Form {
             Section {
-                optionRow(.auto, "自动直连（推荐）", "自动探测局域网 / IPv6 / 公网，选最快的")
+                HStack(alignment: .center, spacing: 8) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(monitor.isProbing ? "正在检测所有线路…" : "检测完成，已按延迟排序")
+                            .font(.subheadline)
+                        if let fastest = fastestRoute {
+                            Text("最快：\(fastest.name)（\(fastest.latency ?? 0)ms）已置顶")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                    Spacer()
+                    Button {
+                        Task { await runAutoProbe() }
+                    } label: {
+                        Label("重新检测", systemImage: "arrow.clockwise")
+                            .font(.subheadline)
+                    }
+                    .disabled(monitor.isProbing)
+                }
+                .padding(.vertical, 2)
+
+                ForEach(monitor.results) { route in
+                    RouteRow(
+                        route: route,
+                        isSelected: route.base == currentBase,
+                        isFastest: route.base == monitor.fastestBase
+                    ) {
+                        useManual(route.base)
+                    }
+                }
+            } header: {
+                Text("线路延迟检测")
+            } footer: {
+                Text("并行测试局域网、IPv6 与公网线路并显示具体延迟（毫秒）。最快可用线路自动置顶；点击任意线路即手动切换，失效线路显示超时并排在最后。")
             }
-            Section("公网地址（优先新地址）") {
-                optionRow(.ngrok, "新固定域名", RouteConfig.newPublic)
-                optionRow(.tailscale, "原地址（备用）", RouteConfig.backupPublic)
-            }
-            Section("自定义公网地址") {
-                optionRow(.custom, "自定义填写", "完整的 http:// 或 https:// 地址")
-                if choice == .custom {
-                    TextField("https://example.com", text: $customDraft)
+
+            Section {
+                HStack(alignment: .top) {
+                    TextField("https://你的服务地址", text: $customDraft, axis: .vertical)
+                        .keyboardType(.URL)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
-                        .keyboardType(.URL)
-                    if !error.isEmpty { Text(error).font(.footnote).foregroundStyle(.red) }
+                    if !customDraft.isEmpty {
+                        Button { customDraft = "" } label: {
+                            Image(systemName: "xmark.circle.fill")
+                        }
+                        .foregroundStyle(.secondary)
+                    }
                 }
+                Button("连接自定义地址") { applyCustom() }
+                if !error.isEmpty {
+                    Text(error).font(.caption).foregroundStyle(.red)
+                }
+            } header: {
+                Text("自定义服务器地址")
+            } footer: {
+                Text("地址只保存在本机，不会发给任何人。手动连接后进入手动模式，可随时用上面的“重新检测”恢复自动选最快。")
             }
+
+            Section("连接提示") {
+                Label("本机部署时，电脑需要保持开机并运行 LibreTV。", systemImage: "desktopcomputer")
+                Label("局域网连接需手机与电脑在同一网络，首次请允许访问本地网络。", systemImage: "wifi")
+                Label("IPv6 直连需两端网络均支持 IPv6，且家庭网关未拦截入站。", systemImage: "network")
+                Label("公网中转作为出门或直连失败时的兜底线路。", systemImage: "globe")
+            }
+            .font(.subheadline)
+
             Section("关于") {
-                LabeledContent("客户端", value: "LibreTV iOS 2.3.0")
-                Text("基于系统 WKWebView；影视搜索与播放由你的 LibreTV 服务提供。")
+                LabeledContent("客户端", value: "LibreTV iOS")
+                Link("LibreTV 开源项目", destination: URL(string: "https://github.com/LibreSpark/LibreTV")!)
+                Text("非官方自用客户端，基于系统 WKWebView；影视搜索与播放由你的 LibreTV 服务提供。")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
         .navigationTitle("服务器地址")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
-            ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }
-            ToolbarItem(placement: .confirmationAction) { Button("连接") { apply() } }
-        }
-        .onAppear {
-            if autoRoute {
-                choice = .auto
-            } else if manualURL == RouteConfig.newPublic {
-                choice = .ngrok
-            } else if manualURL == RouteConfig.backupPublic {
-                choice = .tailscale
-            } else {
-                choice = .custom
-                customDraft = manualURL
+            ToolbarItem(placement: .cancellationAction) {
+                Button("取消") { dismiss() }
             }
         }
+        .onAppear { customDraft = currentBase }
     }
 
-    private func optionRow(_ c: ServerChoice, _ title: String, _ sub: String) -> some View {
-        Button {
-            choice = c
-        } label: {
-            HStack(spacing: 10) {
+    private var fastestRoute: RouteProbeResult? {
+        guard let base = monitor.fastestBase else { return nil }
+        return monitor.results.first { $0.base == base }
+    }
+
+    private func runAutoProbe() async {
+        let best = await monitor.probe()
+        resolvedURL = best
+        autoRoute = true
+        dismiss()
+    }
+
+    private func useManual(_ base: String) {
+        manualURL = base
+        autoRoute = false
+        dismiss()
+    }
+
+    private func applyCustom() {
+        var text = customDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        if text.isEmpty { error = "请填写地址"; return }
+        if !text.hasPrefix("http://") && !text.hasPrefix("https://") {
+            text = "https://" + text
+        }
+        guard RouteConfig.isValid(text) else {
+            error = "地址不对，检查一下"
+            return
+        }
+        customDraft = text
+        manualURL = text
+        autoRoute = false
+        dismiss()
+    }
+}
+
+private struct RouteRow: View {
+    let route: RouteProbeResult
+    let isSelected: Bool
+    let isFastest: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 12) {
+                Image(systemName: route.kind.icon)
+                    .font(.system(size: 18))
+                    .foregroundStyle(iconColor)
+                    .frame(width: 28)
+
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(title).foregroundStyle(.primary)
-                    Text(sub).font(.caption).foregroundStyle(.secondary)
+                    HStack(spacing: 6) {
+                        Text(route.name)
+                            .font(.subheadline)
+                            .foregroundStyle(.primary)
+                        if isFastest {
+                            Text("最快")
+                                .font(.caption2.weight(.bold))
+                                .padding(.horizontal, 5).padding(.vertical, 1)
+                                .background(Color.green.opacity(0.15))
+                                .foregroundStyle(.green)
+                                .clipShape(Capsule())
+                        }
+                    }
+                    Text(route.base)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
                 }
-                Spacer()
-                if choice == c { Image(systemName: "checkmark").foregroundStyle(.cyan) }
+
+                Spacer(minLength: 4)
+                trailing
             }
+            .padding(.vertical, 4)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(accessibilityText)
+    }
+
+    @ViewBuilder
+    private var trailing: some View {
+        if route.probing {
+            ProgressView()
+        } else if let ms = route.latency {
+            Text("\(ms)ms")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(isFastest ? Color.green : Color.cyan)
+        } else {
+            Text("超时")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        if isSelected {
+            Image(systemName: "checkmark")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.cyan)
         }
     }
 
-    private func apply() {
-        switch choice {
-        case .auto:
-            autoRoute = true
-            dismiss()
-        case .ngrok:
-            autoRoute = false
-            manualURL = RouteConfig.newPublic
-            dismiss()
-        case .tailscale:
-            autoRoute = false
-            manualURL = RouteConfig.backupPublic
-            dismiss()
-        case .custom:
-            var text = customDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-            if text.isEmpty { error = "请填写地址"; return }
-            if !text.hasPrefix("http://") && !text.hasPrefix("https://") { text = "https://" + text }
-            guard let u = URL(string: text), u.host != nil else {
-                error = "地址不对，检查一下"
-                return
-            }
-            autoRoute = false
-            manualURL = text
-            dismiss()
+    private var iconColor: Color {
+        switch route.kind {
+        case .lan: return .blue
+        case .ipv6: return .purple
+        case .publicRoute: return .orange
         }
+    }
+
+    private var accessibilityText: String {
+        if let ms = route.latency { return "\(route.name)，延迟 \(ms) 毫秒" }
+        return "\(route.name)，不可达"
     }
 }
