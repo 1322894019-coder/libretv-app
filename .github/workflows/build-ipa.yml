@@ -10,7 +10,8 @@ permissions:
 
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: macos-14
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - name: Show Xcode version
@@ -24,13 +25,17 @@ jobs:
           /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity dict" "$PLIST"
           /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity:NSAllowsArbitraryLoads bool true" "$PLIST"
           /usr/libexec/PlistBuddy -c "Print :NSAppTransportSecurity" "$PLIST"
+      - name: Verify app icon is bundled
+        run: |
+          ls -la build/Build/Products/Release-iphoneos/LibreTV.app | grep -i icon || true
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIcons" "build/Build/Products/Release-iphoneos/LibreTV.app/Info.plist" || true
       - name: Package IPA
         run: |
           mkdir -p Payload
           cp -r build/Build/Products/Release-iphoneos/LibreTV.app Payload/
           zip -r LibreTV.ipa Payload
           ls -lh LibreTV.ipa
-          unzip -l LibreTV.ipa | head -30
+          unzip -l LibreTV.ipa | head -40
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
@@ -40,4 +45,4 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "build-${{ github.run_number }}" LibreTV.ipa --title "LibreTV build ${{ github.run_number }}" --notes "LibreTV 2.2.0 未签名 IPA：修复物理音量键；新增局域网直连、IPv6 直连与公网兜底，自动选择最快线路。可用直装工具安装。"
+          gh release create "build-${{ github.run_number }}" LibreTV.ipa --title "LibreTV build ${{ github.run_number }}" --notes "LibreTV 未签名 IPA：保留原 LOGO；新增 IPv6 直连与局域网连接；自动检测所有线路延迟并显示具体毫秒数值，最快线路自动置顶推荐，公网中转兜底。可用直装工具签名安装。"
