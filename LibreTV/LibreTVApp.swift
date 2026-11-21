@@ -247,7 +247,7 @@ struct WebView: UIViewRepresentable {
         let store: WebViewStore
         private var progressObservation: NSKeyValueObservation?
 
-        init(store: WebView) { self.store = store }
+        init(store: WebViewStore) { self.store = store }
 
         func startObserving(webView: WKWebView) {
             progressObservation = webView.observe(\.estimatedProgress, options: [.new]) { [weak self] webView, _ in
